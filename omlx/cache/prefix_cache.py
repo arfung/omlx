@@ -2128,6 +2128,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Step 3: CacheList fallback — check sub-states for seq_len
         # This handles all-CacheList models (e.g., deepseek_v32) and Hy4 Flash,
         # whose CacheList layers hold the whole sequence next to a window.
+        # The longest sub-cache is the sequence: ERNIE 5.5's first layers hold
+        # only a window and a pooled history, and its whole-sequence members
+        # sit in later layers. Stopping at the first sub-cache returned the
+        # window there, so a store after a restore sliced its new blocks from
+        # the start of the cache.
+        cachelist_seq_len = 0
         for layer_state in cache_data:
             if (
                 layer_state.get("cache_type") == "CacheList"
@@ -2138,9 +2144,12 @@ class BlockAwarePrefixCache(CacheManager):
                     if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
                         sub_keys = sub_state[0]
                         if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
-                            seq_len = sub_keys.shape[2]
-                            logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
-                            return max(seq_len, max_seq_len)
+                            cachelist_seq_len = max(
+                                cachelist_seq_len, sub_keys.shape[2]
+                            )
+        if cachelist_seq_len > 0:
+            logger.debug(f"Using CacheList sub-cache seq_len={cachelist_seq_len}")
+            return max(cachelist_seq_len, max_seq_len)
 
         if max_seq_len > 0:
             # Normal result for all-non-sliceable-KVCache models
