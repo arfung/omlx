@@ -12054,6 +12054,9 @@ class Scheduler:
                 greedy=not float(
                     getattr(request.sampling_params, "temperature", 0.0) or 0.0
                 ),
+                history=(
+                    list(request.prompt_token_ids or []) if block_drafter else None
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -12139,7 +12142,12 @@ class Scheduler:
             getattr(drafter.model.config, "block_size", 4)
         )
         max_per_round = max(1, block_size - 1)
-        acceptance_rate = total_accepted / (rounds * max_per_round)
+        total_drafted = rounds * max_per_round
+        # A drafter that varies its depth per round reports what it drafted.
+        draft_lens = getattr(drafter.model, "draft_lens", None)
+        if isinstance(draft_lens, list) and len(draft_lens) == rounds:
+            total_drafted = max(1, sum(int(x) for x in draft_lens))
+        acceptance_rate = total_accepted / total_drafted
         avg_tokens_per_round = (total_accepted + rounds) / rounds
         logger.info(
             "vlm_mtp stats: request=%s finish=%s rounds=%d "
@@ -12149,7 +12157,7 @@ class Scheduler:
             finish_reason,
             rounds,
             total_accepted,
-            rounds * max_per_round,
+            total_drafted,
             acceptance_rate * 100,
             avg_tokens_per_round,
             state.emitted,

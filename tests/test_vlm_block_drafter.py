@@ -38,7 +38,7 @@ def test_load_accepts_the_ernie_dspark_head():
         drafter = vlm_mtp.load_vlm_mtp_drafter("/models/ernie")
     assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
     assert drafter.draft_kind == "dflash"
-    assert drafter.default_block_size == 6
+    assert drafter.default_block_size == 8
 
 
 def test_load_still_rejects_other_block_drafters():
@@ -86,7 +86,9 @@ def test_decode_dispatches_a_block_drafter_to_dflash_rounds():
     captured = {}
 
     def fake_rounds(model, draft_model, prompt_cache, seen_hidden, **kwargs):
-        captured.update(kwargs, model=model, draft_model=draft_model, hidden=seen_hidden)
+        captured.update(
+            kwargs, model=model, draft_model=draft_model, hidden=seen_hidden
+        )
         yield 11, None
         yield 22, None
 
@@ -107,10 +109,18 @@ def test_decode_dispatches_a_block_drafter_to_dflash_rounds():
                 sampler=sampler,
                 draft_block_size=6,
                 greedy=True,
+                history=[1, 2, 3],
             )
         )
 
     assert tokens == [7, 11, 22]
+    # The drafter is told the prompt and every committed token, in order.
+    drafter.model.begin_request.assert_called_once_with([1, 2, 3])
+    assert [call.args[0] for call in drafter.model.observe.call_args_list] == [
+        7,
+        11,
+        22,
+    ]
     mtp_rounds.assert_not_called()
     clear.assert_not_called()
     assert captured["model"] is target
@@ -249,3 +259,4 @@ def test_scheduler_seeds_a_block_drafter_with_layer_captures(
     assert captured["first_bonus"] == 2
     assert captured["draft_block_size"] == 6
     assert captured["greedy"] is greedy
+    assert captured["history"] == [1, 2, 3]

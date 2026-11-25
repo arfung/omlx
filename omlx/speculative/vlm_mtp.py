@@ -76,10 +76,11 @@ BLOCK_DRAFTER_MODEL_TYPES = frozenset({"ernie5_5_dspark"})
 _BUNDLED_BLOCK_DRAFT_TARGETS = frozenset({"ernie5_5_moe"})
 # Rounds between buffer-pool drains on the block-drafter path.
 _BLOCK_DRAFT_CLEAR_ROUNDS = 64
-# Block (anchor + proposals) drafted when the model settings leave it unset.
-# mlx-vlm's own default verifies a single proposal per round. On an M5 Ultra,
-# 6 matched 8 on code and beat it on prose; 4 was slower on code.
-_BLOCK_DRAFT_DEFAULT_BLOCK = 6
+# Largest block (anchor + proposals) drafted when the model settings leave it
+# unset. mlx-vlm's own default verifies a single proposal per round. The ERNIE
+# drafter chooses each round's depth from the request's acceptance so far, up
+# to this ceiling, so the trained block size is the right default.
+_BLOCK_DRAFT_DEFAULT_BLOCK = 8
 
 
 def bundled_block_drafter_path(model_path: Any) -> Optional[str]:
@@ -332,12 +333,15 @@ def run_vlm_mtp_decode(
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
     greedy: bool = False,
+    history: Optional[List[int]] = None,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
     A block drafter (``drafter.draft_kind == "dflash"``) runs mlx-vlm's DFlash
     rounds instead: ``hidden`` is then the concatenated target-layer captures
     of the committed positions, and ``greedy`` selects exact-match verify.
+    ``history`` (the prompt's token ids) lets a drafter that supports it
+    draft by copying text the reply repeats from the request.
 
     Yields plain Python ints for single-request decode (``first_bonus`` is
     ``int`` or a B=1 ``mx.array``), or ``List[Optional[int]]`` rows for
@@ -370,6 +374,16 @@ def run_vlm_mtp_decode(
         first_bonus_int = int(
             first_bonus.item() if isinstance(first_bonus, mx.array) else first_bonus
         )
+        # The drafter follows the request's tokens: the prompt, then every
+        # committed token before the round that drafts after it.
+        begin = getattr(drafter.model, "begin_request", None)
+        observe = getattr(drafter.model, "observe", None)
+        if callable(begin):
+            begin(history)
+        if not callable(observe):
+            observe = None
+        if observe is not None:
+            observe(first_bonus_int)
         yield first_bonus_int
         rounds = _dflash_rounds(
             target_for_rounds,
@@ -396,6 +410,8 @@ def run_vlm_mtp_decode(
                 if finished - cleared_at >= _BLOCK_DRAFT_CLEAR_ROUNDS:
                     _sync_and_clear_cache(_vlm_generation_stream)
                     cleared_at = finished
+                if observe is not None:
+                    observe(tok)
                 yield tok
         finally:
             close = getattr(rounds, "close", None)
