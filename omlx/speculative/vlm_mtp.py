@@ -66,6 +66,7 @@ from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
 from ..patches.qwen35_verify_qmm import set_verify_qmm_armed  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
+from .block_rows import SharedBlockRounds  # noqa: E402
 
 _vlm_generation_stream = _vlm_common.generation_stream
 
@@ -117,6 +118,9 @@ class VLMMTPDrafter:
         self.default_block_size = (
             _BLOCK_DRAFT_DEFAULT_BLOCK if draft_kind == "dflash" else None
         )
+        # Rounds shared by the requests drafting at the moment, when the
+        # target can verify their blocks in one forward (shared_block_rounds).
+        self.shared_rounds: SharedBlockRounds | None = None
 
 
 class _VLMAdapterMTPProxy:
@@ -219,6 +223,40 @@ class _MTPResetBindingProxy:
             finally:
                 self._target_proxy._expose_language_model = False
         return self._drafter.reset(target_model, *args, **kwargs)
+
+
+def shared_block_rounds(
+    drafter: VLMMTPDrafter,
+    target_language_model: Any,
+    draft_block_size: int | None = None,
+) -> SharedBlockRounds | None:
+    """The rounds that requests drafting with ``drafter`` share, or None.
+
+    None means the target verifies one request per forward or the drafter
+    holds one request's state, and mlx-vlm's own loop serves the request.
+    The rounds are built on first use and kept while requests are in them.
+    """
+    if getattr(drafter, "draft_kind", None) != "dflash":
+        return None
+    rounds = getattr(drafter, "shared_rounds", None)
+    if (
+        rounds is not None
+        and rounds.adapter is target_language_model
+        and (rounds.rows or rounds.block_size == draft_block_size)
+    ):
+        return rounds
+    target, draft_model = target_language_model, drafter.model
+    adapter_lm = getattr(target_language_model, "_language_model", None)
+    if adapter_lm is not None:
+        target = _VLMAdapterMTPProxy(target_language_model, adapter_lm)
+        draft_model = _MTPResetBindingProxy(drafter.model, target)
+    if not SharedBlockRounds.supported(target, draft_model):
+        return None
+    rounds = SharedBlockRounds(target, draft_model, block_size=draft_block_size)
+    rounds.adapter = target_language_model
+    rounds.block_size = draft_block_size
+    drafter.shared_rounds = rounds
+    return rounds
 
 
 def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
@@ -348,6 +386,11 @@ def run_vlm_mtp_decode(
     batched decode (B > 1 ``mx.array``). ``None`` slots in the batched
     form mark rows that have finished.
 
+    A block drafter whose target verifies several requests in one forward
+    (ERNIE 5.5 Flash) yields ``List[int]`` instead: this request's tokens of
+    one round, in order. Requests decoding at the same time share each round's
+    verify forward (see ``block_rows``).
+
     The wrapper yields ``first_bonus`` as its first value: mlx-vlm's
     ``_mtp_rounds`` / ``_mtp_rounds_batch`` expect the caller to have
     already emitted the bonus token before the round loop starts
@@ -374,6 +417,22 @@ def run_vlm_mtp_decode(
         first_bonus_int = int(
             first_bonus.item() if isinstance(first_bonus, mx.array) else first_bonus
         )
+        shared = shared_block_rounds(drafter, target_language_model, draft_block_size)
+        if shared is not None:
+            stream = shared.add(
+                prompt_cache,
+                hidden,
+                first_bonus_int,
+                max_tokens,
+                sampler,
+                greedy=greedy,
+                history=history,
+            )
+            try:
+                yield from stream
+            finally:
+                stream.close()
+            return
         # The drafter follows the request's tokens: the prompt, then every
         # committed token before the round that drafts after it.
         begin = getattr(drafter.model, "begin_request", None)

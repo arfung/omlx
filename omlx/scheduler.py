@@ -112,6 +112,7 @@ from .speculative.processing_sampler import (
 from .speculative.vlm_mtp import (
     VLMMTPDrafter,
     run_vlm_mtp_decode,
+    shared_block_rounds,
     vlm_mtp_positioned_sampling_available,
 )
 from .utils.fatal import (
@@ -11885,12 +11886,18 @@ class Scheduler:
         # only one vlm_mtp generator can own it at a time. A request that
         # arrives after MTP has started cannot be migrated here; retain the
         # existing safe BatchGenerator fallback for that late-arrival case.
-        if self._vlm_mtp_active:
+        # A block drafter whose target verifies several requests in one
+        # forward keeps that state per request (speculative/block_rows.py).
+        shared_rounds = shared_block_rounds(
+            drafter, self.model, getattr(self, "_vlm_mtp_draft_block_size", None)
+        )
+        drafting_count = len(self._vlm_mtp_active)
+        if drafting_count and shared_rounds is None:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
                 "request(s); falling back to BatchGenerator",
                 request.request_id,
-                len(self._vlm_mtp_active),
+                drafting_count,
             )
             return None
 
@@ -11905,7 +11912,21 @@ class Scheduler:
             getattr(prefill, "request_id", None) != request.request_id
             for prefill in getattr(self, "prefilling", ())
         )
-        if waiting_count or running_count or prefilling_count:
+        if shared_rounds is not None:
+            # A few requests draft together. Peers that already decode
+            # without drafting are joined instead, and so are three or more
+            # that start at once: on ERNIE 5.5 Flash they batch as fast
+            # without drafting. A request that arrives while others draft
+            # joins them while there is room, since they cannot move.
+            if running_count > drafting_count:
+                contended = True
+            elif drafting_count:
+                contended = drafting_count >= shared_rounds.max_requests
+            else:
+                contended = waiting_count + prefilling_count >= 2
+        else:
+            contended = bool(waiting_count or running_count or prefilling_count)
+        if contended:
             logger.info(
                 "vlm_mtp routing skipped for %s: scheduler contention "
                 "(running=%d waiting=%d prefilling=%d); falling back to "
@@ -12131,7 +12152,14 @@ class Scheduler:
         drafter = self._vlm_mtp_drafter
         if drafter is None:
             return
-        accept_lens = getattr(drafter.model, "accept_lens", None)
+        # Shared block rounds keep each request's counts with the request.
+        stats = drafter.model
+        shared_rounds = getattr(drafter, "shared_rounds", None)
+        if shared_rounds is not None:
+            row = shared_rounds.row_for(state.prompt_cache)
+            if row is not None:
+                stats = row
+        accept_lens = getattr(stats, "accept_lens", None)
         if not accept_lens:
             return
         try:
@@ -12148,7 +12176,7 @@ class Scheduler:
         max_per_round = max(1, block_size - 1)
         total_drafted = rounds * max_per_round
         # A drafter that varies its depth per round reports what it drafted.
-        draft_lens = getattr(drafter.model, "draft_lens", None)
+        draft_lens = getattr(stats, "draft_lens", None)
         if isinstance(draft_lens, list) and len(draft_lens) == rounds:
             total_drafted = max(1, sum(int(x) for x in draft_lens))
         acceptance_rate = total_accepted / total_drafted
@@ -12207,13 +12235,11 @@ class Scheduler:
                 state.finished = True
                 continue
 
-            # Single-request mode yields ints; batch mode (not yet routed
-            # by omlx) would yield a list. Guard so the path stays robust
-            # if we widen routing later.
+            # One token per step from mlx-vlm's own loops. Shared block
+            # rounds yield a list: this request's tokens of one round.
             if isinstance(token_val, list):
-                # Take the first row (we only route singles for now).
-                tok = next((t for t in token_val if t is not None), None)
-                if tok is None:
+                tokens = [int(t) for t in token_val if t is not None]
+                if not tokens:
                     responses.append(
                         _VLMMTPResponse(
                             uid=uid,
@@ -12224,35 +12250,40 @@ class Scheduler:
                     )
                     state.finished = True
                     continue
-                token = int(tok)
             else:
-                token = int(token_val)
+                tokens = [int(token_val)]
 
-            state.emitted += 1
-            finish_reason: str | None = None
-            if state.stop_token_ids and token in state.stop_token_ids:
-                finish_reason = "stop"
-            elif state.emitted >= state.max_tokens:
-                finish_reason = "length"
+            for token in tokens:
+                state.emitted += 1
+                finish_reason: str | None = None
+                if state.stop_token_ids and token in state.stop_token_ids:
+                    finish_reason = "stop"
+                elif state.emitted >= state.max_tokens:
+                    finish_reason = "length"
 
-            if finish_reason is not None:
-                self._log_vlm_mtp_stats(state, finish_reason)
+                if finish_reason is not None:
+                    self._log_vlm_mtp_stats(state, finish_reason)
 
-            responses.append(
-                _VLMMTPResponse(
-                    uid=uid,
-                    token=token,
-                    finish_reason=finish_reason,
-                    prompt_cache=(
-                        state.prompt_cache if finish_reason is not None else None
-                    ),
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=token,
+                        finish_reason=finish_reason,
+                        prompt_cache=(
+                            state.prompt_cache if finish_reason is not None else None
+                        ),
+                    )
                 )
-            )
-            if finish_reason is not None:
-                state.finished = True
+                if finish_reason is not None:
+                    state.finished = True
+                    break
 
-        # Drop finished entries.
+        # Drop finished entries. Closing the generator takes the request out
+        # of shared block rounds at once, not when it is collected.
         for uid in [u for u, s in self._vlm_mtp_active.items() if s.finished]:
+            close = getattr(self._vlm_mtp_active[uid].generator, "close", None)
+            if callable(close):
+                close()
             del self._vlm_mtp_active[uid]
 
         return responses
