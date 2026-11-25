@@ -2589,11 +2589,15 @@ class Scheduler:
         # is exhausted long before any byte limit — the
         # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
         # Periodic materialization collapses the chain; enable it for every
-        # ArraysCache hybrid, not just MiniMax.
+        # ArraysCache hybrid, not just MiniMax. Models with a pooled history
+        # (ERNIE 5.5 Flash) hit the same limit: two batched requests failed
+        # about 11,500 tokens in, one buffer per layer per step.
         model_name_lower = (self.config.model_name or "").lower()
         self._decode_eval_kv_cache_interval: int = (
             256
-            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            if "minimax" in model_name_lower
+            or self._model_has_arrays_cache()
+            or self._detect_pooling_cache()
             else 0
         )
         self._tokens_since_kv_cache_eval: int = 0
