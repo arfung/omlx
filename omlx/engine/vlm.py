@@ -2761,6 +2761,15 @@ class VLMBatchedEngine(BaseEngine):
             )
             if tagged:
                 logger.info("MiniMax A8 prefill on %d modules", tagged)
+        elif a8_on and self.model_type == "ernie5_5_moe":
+            from ..patches.ernie5_5 import a8 as ernie_a8
+
+            tagged = ernie_a8.tag(
+                self._vlm_model,
+                int(getattr(self._model_settings, "a8_prefill_min_tokens", 128)),
+            )
+            if tagged:
+                logger.info("ERNIE A8 prefill on %d expert layers", tagged)
         elif a8_on and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch

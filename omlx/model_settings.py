@@ -261,16 +261,22 @@ def a8_prefill_on(settings: Any) -> bool:
     return bool(_setting(settings, "a8_prefill_enabled"))
 
 
-_A8_EXACT_MODEL_TYPES = ("qwen4_exp", "deepseek_v41", "minimax_m3", "minimax_m3_vl")
+_A8_EXACT_MODEL_TYPES = (
+    "qwen4_exp",
+    "deepseek_v41",
+    "minimax_m3",
+    "minimax_m3_vl",
+    "ernie5_5_moe",
+)
 
 
 def oq_a8_model_supported(config_type: str | None) -> bool:
     """True for the model families the A8 prefill paths can route.
 
     Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``),
-    DeepSeek V4.1 and MiniMax M3/M3.1 match exactly: only those validated
-    checkpoint families have routed-expert A8, so a ``qwen4`` prefix would
-    admit unvalidated models.
+    DeepSeek V4.1, MiniMax M3/M3.1 and ERNIE 5.5 Flash match exactly: only
+    those validated checkpoint families have routed-expert A8, so a ``qwen4``
+    prefix would admit unvalidated models.
     """
     config_type = str(config_type or "").lower().replace("-", "_")
     return config_type in _A8_EXACT_MODEL_TYPES or config_type.startswith(
