@@ -48,6 +48,11 @@ from ..utils.metal_sync import _sync_and_clear_cache
 # request needs its anchor and one proposal; measured on ERNIE 5.5 Flash, four
 # requests of two rows each are slower than four rows of plain batched decode.
 MAX_REQUESTS = 3
+# Requests that begin drafting together when none drafts yet. Measured on
+# ERNIE 5.5 Flash: two draft together faster than they batch without
+# drafting, three do not. A third still joins requests that already draft,
+# since those cannot go back.
+START_TOGETHER = 2
 # Reach probability a proposal needs when this many requests share a round.
 # One request keeps the drafter's own thresholds. With more, the forward's
 # fixed cost is already spread over the requests, so a row has to earn more.
@@ -141,6 +146,7 @@ class SharedBlockRounds:
         self.adapter: Any = None
         self.limit = int(getattr(self.lm, "verify_rows_limit", 8))
         self.max_requests = max(1, min(int(max_requests), self.limit // 2))
+        self.start_together = min(START_TOGETHER, self.max_requests)
         self.token_dtype = token_dtype
         self.rows: list[_Row] = []
         self.rounds = 0

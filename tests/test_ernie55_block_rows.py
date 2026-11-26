@@ -292,7 +292,7 @@ def test_route_lets_a_few_requests_draft_together(
     monkeypatch.setattr(
         scheduler_mod,
         "shared_block_rounds",
-        lambda *args, **kwargs: SimpleNamespace(max_requests=3),
+        lambda *args, **kwargs: SimpleNamespace(max_requests=3, start_together=2),
     )
     request = SimpleNamespace(
         request_id="req",
@@ -319,3 +319,239 @@ def test_route_lets_a_few_requests_draft_together(
     assert ("scheduler contention" in caplog.text) is contended
     assert ("rollback_speculative_cache" in caplog.text) is not contended
     assert "drafter is busy" not in caplog.text
+
+
+class _Adapter:
+    """The model as the scheduler holds it: bare logits for the generation
+    batch, the whole output for the forward that seeds the drafter."""
+
+    def __init__(self, model):
+        self._language_model = model.language_model
+
+    def __call__(self, tokens, cache=None, **kwargs):
+        output = self._language_model(tokens, cache=cache, **kwargs)
+        return output if kwargs.get("capture_layer_ids") else output.logits
+
+
+def _scheduler(model, draft, block_size=4):
+    """A scheduler's decode side: the real generation batch and the real
+    routing, promotion and drafter steps, around a small model."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.scheduler import Scheduler
+    from omlx.speculative.vlm_mtp import VLMMTPDrafter
+
+    adapter = _Adapter(model)
+    sched = SimpleNamespace(
+        model=adapter,
+        batch_generator=BatchGenerator(adapter, sampler=_greedy),
+        _vlm_mtp_drafter=VLMMTPDrafter(draft, "dflash", "/p"),
+        _vlm_mtp_draft_block_size=block_size,
+        _vlm_mtp_active={},
+        _vlm_mtp_next_uid=-1,
+        _model_suppress_tokens=(),
+        _pending_abort_ids=set(),
+        _stream=mx.default_stream(mx.default_device()),
+        _PROMOTE_MIN_TOKENS=Scheduler._PROMOTE_MIN_TOKENS,
+        _get_stop_tokens=lambda: set(),
+        request_id_to_uid={},
+        uid_to_request_id={},
+        running={},
+        waiting=deque(),
+        prefilling=deque(),
+        tokens={},
+    )
+    for name in (
+        "_memory_requeue_row",
+        "_plain_rows_to_promote",
+        "_promote_plain_requests",
+        "_route_to_vlm_mtp",
+        "_step_vlm_mtp",
+        "_log_vlm_mtp_stats",
+    ):
+        setattr(sched, name, getattr(Scheduler, name).__get__(sched))
+    return sched
+
+
+def _insert_plain(sched, model, name, prompt, count, sampler=_greedy):
+    """Prefill a request and put it in the generation batch, not drafting."""
+    from types import SimpleNamespace
+
+    cache = model.make_cache()
+    mx.eval(sched.model(mx.array([prompt[:-1]]), cache=cache))
+    (uid,) = sched.batch_generator.insert(
+        [prompt[-1:]],
+        max_tokens=[count],
+        caches=[cache],
+        all_tokens=[list(prompt[:-1])],
+        samplers=[sampler],
+        logits_processors=[[]],
+    )
+    request = SimpleNamespace(
+        request_id=name,
+        prompt_token_ids=list(prompt),
+        rope_deltas=0.0,
+        sampling_params=SimpleNamespace(
+            max_tokens=count,
+            temperature=0.0 if sampler is _greedy else 1.0,
+            logprobs=False,
+            stop_token_ids=None,
+            ignore_eos=True,
+        ),
+    )
+    sched.running[name] = request
+    sched.request_id_to_uid[name] = uid
+    sched.uid_to_request_id[uid] = name
+    sched.tokens[name] = []
+    return request
+
+
+def _step(sched):
+    """One decode step, as Scheduler.step runs it; drops requests that end."""
+    responses = sched._promote_plain_requests()
+    responses.extend(sched.batch_generator.next_generated())
+    responses.extend(sched._step_vlm_mtp())
+    for response in responses:
+        name = sched.uid_to_request_id.get(response.uid)
+        if name not in sched.running:
+            continue
+        assert getattr(response, "error", None) is None
+        sched.tokens[name].append(int(response.token))
+        if response.finish_reason is not None:
+            del sched.running[name]
+            del sched.request_id_to_uid[name]
+    return responses
+
+
+def _run(sched, limit=400):
+    for _ in range(limit):
+        if not sched.running:
+            return
+        _step(sched)
+    raise AssertionError("requests did not finish")
+
+
+def test_a_plain_request_starts_drafting_when_its_peer_finishes(target):
+    config, model = target
+    counts = (12, 60)
+    reference = [
+        helpers._decode_one_by_one(model, p, n) for p, n in zip(PROMPTS, counts)
+    ]
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    requests = [
+        _insert_plain(sched, model, f"r{i}", PROMPTS[i], counts[i]) for i in range(2)
+    ]
+    # Two plain requests could draft together; hold them back as a third
+    # request waiting to start would.
+    sched.waiting.append(object())
+    while "r0" in sched.running:
+        _step(sched)
+    assert not sched._vlm_mtp_active
+    assert sched.request_id_to_uid["r1"] >= 0
+    done = len(sched.tokens["r1"])
+    sched.waiting.clear()
+    _step(sched)
+    # The request left the batch for the drafter and lost no token on the way.
+    assert sched.request_id_to_uid["r1"] < 0
+    assert requests[1].batch_uid == sched.request_id_to_uid["r1"]
+    assert not len(sched.batch_generator._generation_batch)
+    assert len(sched.tokens["r1"]) > done + 1
+    _run(sched)
+    assert [sched.tokens["r0"], sched.tokens["r1"]] == reference
+    rounds = sched._vlm_mtp_drafter.shared_rounds
+    assert 0 < rounds.rounds < counts[1] - done
+    assert not rounds.rows
+
+
+def test_two_plain_requests_start_drafting_together(target):
+    config, model = target
+    counts = (8, 44, 52)
+    reference = [
+        helpers._decode_one_by_one(model, p, n) for p, n in zip(PROMPTS, counts)
+    ]
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    for i in range(3):
+        _insert_plain(sched, model, f"r{i}", PROMPTS[i], counts[i])
+    while "r0" in sched.running:
+        _step(sched)
+        # Three do not draft together, so none moves while all three run.
+        assert "r0" not in sched.running or not sched._vlm_mtp_active
+    _step(sched)
+    assert len(sched._vlm_mtp_active) == 2
+    _run(sched)
+    assert [sched.tokens[f"r{i}"] for i in range(3)] == reference
+    assert sched._vlm_mtp_drafter.shared_rounds.shared_drafts > 0
+
+
+def test_a_plain_request_joins_one_that_drafts(target):
+    config, model = target
+    counts = (40, 40)
+    reference = [
+        helpers._decode_one_by_one(model, p, n) for p, n in zip(PROMPTS, counts)
+    ]
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    _insert_plain(sched, model, "r0", PROMPTS[0], counts[0])
+    _step(sched)
+    _step(sched)
+    assert sched.request_id_to_uid["r0"] < 0
+    # A request that reached the batch while the first one drafts.
+    _insert_plain(sched, model, "r1", PROMPTS[1], counts[1])
+    for _ in range(3):
+        _step(sched)
+    assert sched.request_id_to_uid["r1"] < 0
+    _run(sched)
+    assert [sched.tokens["r0"], sched.tokens["r1"]] == reference
+
+
+@pytest.mark.parametrize(
+    "change,moves",
+    [
+        ({}, True),
+        ({"logprobs": True}, False),  # the drafter's loop reports none
+        ({"left": 8}, False),  # too little left to be worth the move
+        ({"waiting": 1}, False),  # a request about to start would not draft
+        ({"aborting": True}, False),
+    ],
+)
+def test_which_plain_requests_move_to_the_drafter(target, change, moves):
+    config, model = target
+    count = change.get("left", 60) + 3
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    request = _insert_plain(sched, model, "r0", PROMPTS[0], count)
+    request.sampling_params.logprobs = change.get("logprobs", False)
+    sched.waiting.extend([object()] * change.get("waiting", 0))
+    if change.get("aborting"):
+        sched._pending_abort_ids.add("r0")
+    for _ in range(4):
+        _step(sched)
+    assert (sched.request_id_to_uid.get("r0", 0) < 0) is moves
+
+
+def test_a_sampled_request_moves_with_its_budget_intact(target):
+    config, model = target
+    count = 50
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    mx.random.seed(3)
+    _insert_plain(sched, model, "r0", PROMPTS[0], count, sampler=_sample)
+    _step(sched)
+    _step(sched)
+    assert sched.request_id_to_uid["r0"] < 0
+    _run(sched)
+    # Every token the request was allowed, and no more.
+    assert len(sched.tokens["r0"]) == count
+
+
+def test_a_request_that_cannot_start_drafting_fails_cleanly(target):
+    config, model = target
+    sched = _scheduler(model, helpers._drafter(config, 4))
+    _insert_plain(sched, model, "r0", PROMPTS[0], 40)
+    sched.batch_generator.next_generated()
+    sched._route_to_vlm_mtp = lambda *args, **kwargs: None
+    (response,) = sched._promote_plain_requests()
+    # Reported against the uid the scheduler still maps to the request.
+    assert response.finish_reason == "error" and response.error
+    assert sched.uid_to_request_id[response.uid] == "r0"
+    assert not len(sched.batch_generator._generation_batch)
