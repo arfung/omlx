@@ -45,13 +45,17 @@ from mlx_vlm.speculative.dflash import (  # noqa: SLF001
 from ..utils.metal_sync import _sync_and_clear_cache
 
 # Requests that draft together. The verify forward holds eight rows and every
-# request needs its anchor and one proposal; measured on ERNIE 5.5 Flash, four
-# requests of two rows each are slower than four rows of plain batched decode.
+# request needs its anchor and one proposal. Measured on ERNIE 5.5 Flash,
+# total tok/s: four requests of two rows each give 132 on prose and 141 on
+# code (122 and 128 sampled) against 147 for four rows of plain batched
+# decode. A verify row past the fourth costs about 3 ms, as much as a row of
+# plain decode, and a drafted token is only sometimes kept.
 MAX_REQUESTS = 3
 # Requests that begin drafting together when none drafts yet. Measured on
 # ERNIE 5.5 Flash: two draft together faster than they batch without
-# drafting, three do not. A third still joins requests that already draft,
-# since those cannot go back.
+# drafting (110 and 123 against 85). Three do not: 124 on prose and 129 to
+# 135 on code against 125, and 113 and 119 sampled. A third still joins
+# requests that already draft, since those cannot go back.
 START_TOGETHER = 2
 # Reach probability a proposal needs when this many requests share a round.
 # One request keeps the drafter's own thresholds. With more, the forward's

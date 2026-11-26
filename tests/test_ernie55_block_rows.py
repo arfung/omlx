@@ -85,6 +85,26 @@ def test_requests_drafting_together_decode_what_they_decode_alone(target):
     assert not rounds.rows
 
 
+def test_four_requests_share_the_forward_with_an_anchor_and_a_proposal_each(target):
+    config, model = target
+    prompts = (*PROMPTS, [9, 8, 7, 6, 5, 4, 3])
+    count = 24
+    reference = [helpers._decode_one_by_one(model, p, count) for p in prompts]
+    draft = helpers._drafter(config, 4)
+    rounds = SharedBlockRounds(model, draft, block_size=4, max_requests=4)
+    assert rounds.max_requests == 4
+    streams, outputs = {}, {}
+    for index, prompt in enumerate(prompts):
+        streams[index], _ = _admit(rounds, model, draft, prompt, count)
+        outputs[index] = []
+    assert not rounds.has_room()
+    # Eight rows hold four requests only at the shortest block.
+    assert rounds._block_sizes(list(rounds.rows)) == [2, 2, 2, 2]
+    _drain(streams, outputs)
+    assert [outputs[i] for i in range(len(prompts))] == reference
+    assert not rounds.rows
+
+
 def test_requests_may_join_and_leave_between_rounds(target):
     config, model = target
     counts = (30, 12, 22)
