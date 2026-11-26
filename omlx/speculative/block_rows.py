@@ -8,10 +8,11 @@ of tokens then shifts whole cache rows, which costs more the longer the
 context is.
 
 Here every request keeps its own cache and its own drafter state, and only the
-target's verify forward is shared: ``speculative_verify_rows`` lays the
-requests' blocks end to end and reads the weights once for all the rows. The
-blocks may differ in length, nothing is padded, and each request commits or
-rolls back on its own. A round with one request is the stock round.
+forwards are shared: ``speculative_verify_rows`` lays the requests' blocks end
+to end and reads the target's weights once for all the rows, and
+``draft_block_bases`` does the same for the drafter. The blocks may differ in
+length, nothing is padded, and each request commits or rolls back on its own.
+A round with one request is the stock round.
 """
 
 from __future__ import annotations
@@ -143,6 +144,8 @@ class SharedBlockRounds:
         self.token_dtype = token_dtype
         self.rows: list[_Row] = []
         self.rounds = 0
+        # Rounds whose requests went through the drafter in one forward.
+        self.shared_drafts = 0
         self._cleared_at = 0
 
     @staticmethod
@@ -273,7 +276,34 @@ class SharedBlockRounds:
             for row, size, want in zip(rows, sizes, wants)
         ]
 
-    def _draft(self, row: _Row, size: int) -> None:
+    def _draft_bases(self, rows: list[_Row], sizes: list[int]) -> list[Any]:
+        """One drafter forward for the requests of a round, where it can be.
+
+        Returns each request's share of it, or ``None`` for a request that
+        runs the drafter by itself: a lone request, and one whose first round
+        still has its whole prompt to read into the drafter's context.
+        """
+        bases: list[Any] = [None] * len(rows)
+        forward = getattr(self.draft, "draft_block_bases", None)
+        share = [
+            index
+            for index, (row, size) in enumerate(zip(rows, sizes))
+            if size > 1 and row.hidden.shape[1] <= self.limit
+        ]
+        if not callable(forward) or len(share) < 2:
+            return bases
+        shared = forward(
+            [rows[i].bonus for i in share],
+            [rows[i].hidden for i in share],
+            [rows[i].draft_cache for i in share],
+            [sizes[i] for i in share],
+        )
+        for index, base in zip(share, shared):
+            bases[index] = base
+        self.shared_drafts += 1
+        return bases
+
+    def _draft(self, row: _Row, size: int, base: Any = None) -> None:
         draft = self.draft
         self._use(row)
         draft_fn = (
@@ -296,6 +326,7 @@ class SharedBlockRounds:
             size,
             sampler,
             self.token_dtype,
+            **({} if base is None else {"base": base}),
         )
         row.block = size
         self._keep(row)
@@ -318,8 +349,9 @@ class SharedBlockRounds:
     def _verify(self, rows: list[_Row]) -> None:
         draft, target = self.draft, self.lm
         sizes = self._block_sizes(rows)
-        for row, size in zip(rows, sizes):
-            self._draft(row, size)
+        bases = self._draft_bases(rows, sizes)
+        for row, size, base in zip(rows, sizes, bases):
+            self._draft(row, size, base)
 
         results: list = []
         try:

@@ -210,6 +210,50 @@ def test_sampled_requests_keep_their_own_random_streams(target):
     assert run(PROMPTS[:2]) == together
 
 
+@pytest.mark.parametrize("sampler,greedy", [(_greedy, True), (_sample, False)])
+def test_one_drafter_forward_serves_the_requests_of_a_round(target, sampler, greedy):
+    config, model = target
+    count = 24
+
+    def run(share):
+        draft = helpers._drafter(config, 8)
+        if not share:
+            draft.draft_block_bases = None
+        rounds = SharedBlockRounds(model, draft, block_size=8)
+        drafted = []
+        stock = rounds._draft
+
+        def record(row, size, base=None):
+            stock(row, size, base)
+            drafted.append((row, row.draft_tokens.tolist()))
+
+        rounds._draft = record
+        mx.random.seed(11)
+        streams, outputs = {}, {}
+        for index, prompt in enumerate(PROMPTS):
+            streams[index], _ = _admit(
+                rounds, model, draft, prompt, count, sampler=sampler, greedy=greedy
+            )
+            outputs[index] = []
+        order = {id(stream.row): index for index, stream in streams.items()}
+        _drain(streams, outputs)
+        return (
+            outputs,
+            [(order[id(row)], tokens) for row, tokens in drafted],
+            rounds,
+        )
+
+    outputs, drafted, rounds = run(share=True)
+    apart_outputs, apart_drafted, apart_rounds = run(share=False)
+    # All but the first round, which reads each prompt into the drafter, and
+    # the rounds after the other requests have finished.
+    assert rounds.shared_drafts > rounds.rounds // 2
+    assert apart_rounds.shared_drafts == 0
+    # The requests are drafted the same tokens either way.
+    assert drafted == apart_drafted
+    assert outputs == apart_outputs
+
+
 def test_block_sizes_fit_the_verify_forward(target):
     config, model = target
     draft = helpers._drafter(config, 8)
