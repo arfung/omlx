@@ -1,5 +1,161 @@
 <p> This branch of oMLX has one purpose: allow download and running of Baidu's Ernie 5.5. flash LLM. It has only been tested with the Baidu distro on a Mac M5 Ultra, 256 gig.</p>
 
+# oMLX with ERNIE 5.5 Flash Preview
+
+This is a fork of [oMLX](https://github.com/jundot/omlx). It runs Baidu's
+ERNIE 5.5 Flash Preview on Apple Silicon and makes it fast: drafted decoding
+with the checkpoint's own draft head, faster prompt processing, and drafting
+for requests that overlap.
+
+It is not the official oMLX, and it is offered for evaluation, not as a
+release. The work is described for the maintainer in
+[jundot/omlx discussion 5656](https://github.com/jundot/omlx/discussions/5656).
+Everything from the oMLX logo down is the upstream README, unchanged.
+
+> [!IMPORTANT]
+> The code is not on `main`. Use the branch
+> [`ernie55-preview/9-single-repo`](https://github.com/arfung/omlx/tree/ernie55-preview/9-single-repo).
+> It is oMLX 0.8.4 plus the ERNIE work, and it needs no other repository.
+
+## The model
+
+[baidu/ERNIE-5.5-Flash-Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview),
+the checkpoint as Baidu ships it: 128 weight shards, MXFP8 dense projections
+and MXFP4 routed experts. It is loaded as is, with no conversion.
+
+- About 155 GB on disk and about 167 GB in memory with the draft head.
+- Text only.
+- `baidu/ERNIE-5.5-Flash-Base` is a different model, for plain text
+  completion. This work is for the Preview.
+
+## Speed
+
+Measured on one machine, a Mac with an M5 Ultra and 256 GB, on oMLX 0.8.4 with
+MLX 0.32.5 (26 and 27 November 2026). Greedy decoding unless noted.
+
+One request, calling the model directly:
+
+| | Tokens per second |
+|---|---|
+| Plain decoding, no drafting | 52 |
+| Prose, drafted | 69 |
+| Reasoning, drafted | 87 |
+| Code, drafted | 116 |
+| Rewriting a code file, drafted | 163 |
+| Prose after a 28.7K-token document, drafted | 74 |
+
+The port this work started from decoded at 16 to 17 tokens per second on the
+same machine.
+
+Requests through the server, 400 tokens each, started together:
+
+| Requests | Total tokens per second, prose / code | Drafting |
+|---|---|---|
+| 1 | 78 to 84 / 93 to 98 | Yes |
+| 2 | 104 to 110 / 116 to 125 | Yes |
+| 2, sampled at temperature 1.0 | 99 to 100 / 109 to 112 | Yes |
+| 3 | 125 to 127 | No |
+| 4 | 147 to 149 | No |
+| 8 | 185 | No |
+
+Prompt processing through the server:
+
+| Prompt length | Tokens per second |
+|---|---|
+| 7.2K tokens | 1,650 to 1,660 |
+| 14.4K tokens | 1,590 |
+| 28.8K tokens | 1,460 |
+| 64K to 128K tokens | about 940 |
+
+How it behaves:
+
+- **Drafting covers up to three requests.** One or two requests draft. A
+  third that arrives while they run joins them. Three or more that start
+  together decode as a plain batch, which measured faster there, and move to
+  the drafter when one or two are left.
+- **Some requests never draft.** A request with a grammar constraint or
+  logprobs decodes without drafting.
+- **Drafted text can differ from plain decoding.** Both are valid greedy
+  output. Rounding in half precision can flip a near tie between a one-token
+  forward and a block.
+- **Long context works to 500K tokens.** Prompt processing slows as the
+  context grows: a 498K-token prompt takes about 20 minutes cold. A decode
+  step goes from 20 ms at 8K tokens to 24 ms at 498K. Memory peaked at 176 GB
+  at 128K tokens and 186 GB at 498K.
+- **Conversations keep their whole history.** The port this started from
+  lost the middle of a conversation after the first prefix-cache restore.
+  That is fixed here.
+
+## Build and run
+
+Requires Apple Silicon, macOS 15 or later and Python 3.11 to 3.13.
+
+```bash
+git clone https://github.com/arfung/omlx.git
+cd omlx
+git checkout ernie55-preview/9-single-repo
+python3 -m venv .venv
+source .venv/bin/activate
+make install
+```
+
+`make install` also builds oMLX's native kernels, which needs full Xcode with
+the Metal toolchain. Without Xcode, `make install-no-kernels` skips them.
+ERNIE's own decode kernels are compiled by MLX at run time and do not need
+Xcode, but the model was only tested with the full install.
+
+Download the model into oMLX's model folder:
+
+```bash
+hf download baidu/ERNIE-5.5-Flash-Preview --local-dir ~/.omlx/models/baidu/ERNIE-5.5-Flash-Preview
+```
+
+Start the server. The official oMLX app uses the same port and the same
+memory, so quit it first.
+
+```bash
+omlx serve
+```
+
+Then open `http://localhost:8000/admin`, open the model's settings and turn
+on two switches:
+
+- **Trust Remote Code.** The Preview's tokenizer is Python code inside the
+  checkpoint. oMLX will not run it without this.
+- **VLM MTP.** This turns on drafting with the checkpoint's own draft head.
+  No drafter model needs to be chosen.
+
+Any OpenAI-compatible client can then use `http://localhost:8000/v1` with the
+model `ERNIE-5.5-Flash-Preview`.
+
+## Limits
+
+- **One machine.** Everything was tuned and measured on an M5 Ultra with
+  256 GB. It is untested on M1 to M4 chips and on smaller memory sizes.
+- **Not reviewed.** The code was written, tested and measured with Claude
+  Code under the fork owner's direction. It has not had an independent human
+  review.
+- **Not a release.** There is no app build and no update channel. For
+  anything other than this model, use the official oMLX.
+
+## Credit
+
+The base port is jonathan308's work, from the closed pull requests
+[jundot/omlx#5601](https://github.com/jundot/omlx/pull/5601) and
+[Neywa-Labs/mlx-vlm#2829](https://github.com/Neywa-Labs/mlx-vlm/pull/2829).
+Their commits are kept under their name on the `ernie55-preview/1-base`
+branches. oMLX is by [jundot](https://github.com/jundot).
+
+## The other branches
+
+Branches `ernie55-preview/1-base` to `8-decode-pipelining` hold the same work
+in reviewable steps, and need the matching branches of
+[arfung/mlx-vlm](https://github.com/arfung/mlx-vlm). That fork stays up in
+case the mlx-vlm maintainers want the changes there. To run the model, branch
+9 alone is enough.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
