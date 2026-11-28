@@ -10,17 +10,20 @@ both.
 
 from __future__ import annotations
 
+import importlib
+
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
+from mlx_lm.models.cache import CacheList, KVCache
 
-ernie = pytest.importorskip("mlx_vlm.models.ernie5_5_moe")
-language = pytest.importorskip("mlx_vlm.models.ernie5_5_moe.language")
+from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+from omlx.patches.mlx_vlm_ernie5_5_compat import apply_mlx_vlm_ernie5_5_compat_patch
 
-from mlx_lm.models.cache import CacheList, KVCache  # noqa: E402
-
-from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache  # noqa: E402
-from omlx.patches.deepseek_v4 import apply_pooling_cache_support  # noqa: E402
+apply_mlx_vlm_ernie5_5_compat_patch()
+ernie = importlib.import_module("mlx_vlm.models.ernie5_5_moe")
+language = importlib.import_module("mlx_vlm.models.ernie5_5_moe.language")
 
 WINDOW = 4
 RATIO = 8

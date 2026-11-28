@@ -22,6 +22,7 @@ from typing import Any
 
 import mlx.core as mx
 from mlx_vlm.speculative import common as _vlm_common
+from mlx_vlm.speculative import dflash as _vlm_dflash
 from mlx_vlm.speculative.cache_state import (
     abort_speculative_round,
     commit_speculative_round,
@@ -35,7 +36,6 @@ from mlx_vlm.speculative.common import (  # noqa: SLF001
     _SpeculativeSamplerRNG,
 )
 from mlx_vlm.speculative.dflash import (  # noqa: SLF001
-    _dflash_next_block_size,
     _PositionedDraftSampler,
     _reserve_dflash_target_cache,
     _sample_dflash_target_walk,
@@ -247,7 +247,7 @@ class SharedBlockRounds:
         self, row: _Row, ceiling: int, depth_floor: float | None = None
     ) -> int:
         self._use(row, depth_floor)
-        size = _dflash_next_block_size(
+        size = _vlm_dflash._dflash_next_block_size(
             self.draft, ceiling, row.max_tokens - row.emitted + 1, None
         )
         self._keep(row)

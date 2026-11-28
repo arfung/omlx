@@ -10,13 +10,10 @@ from __future__ import annotations
 
 import mlx.core as mx
 import pytest
+import test_ernie55_dspark as helpers
+from mlx_vlm.speculative.dflash import _dflash_rounds
 
-pytest.importorskip("mlx_vlm.models.ernie5_5_moe")
-helpers = pytest.importorskip("mlx_vlm.tests.test_ernie55_dspark")
-
-from mlx_vlm.speculative.dflash import _dflash_rounds  # noqa: E402
-
-from omlx.speculative.block_rows import SharedBlockRounds  # noqa: E402
+from omlx.speculative.block_rows import SharedBlockRounds
 
 PROMPTS = (
     [5, 9, 2, 44, 7, 81],

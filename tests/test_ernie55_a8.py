@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
+import importlib
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
+from mlx_vlm.models import switch_layers
 
 from omlx.model_settings import oq_a8_model_supported
 from omlx.patches.ernie5_5 import a8
+from omlx.patches.mlx_vlm_ernie5_5_compat import apply_mlx_vlm_ernie5_5_compat_patch
 
-ernie = pytest.importorskip("mlx_vlm.models.ernie5_5_moe")
-language = pytest.importorskip("mlx_vlm.models.ernie5_5_moe.language")
-switch_layers = pytest.importorskip("mlx_vlm.models.switch_layers")
+apply_mlx_vlm_ernie5_5_compat_patch()
+ernie = importlib.import_module("mlx_vlm.models.ernie5_5_moe")
+language = importlib.import_module("mlx_vlm.models.ernie5_5_moe.language")
 
 MXFP4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
 
