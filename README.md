@@ -1,3 +1,5 @@
+<p> This branch of oMLX has one purpose: allow download and running of Baidu's Ernie 5.5. flash LLM. It has only been tested with the Baidu distro on a Mac M5 Ultra, 256 gig.</p>
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
@@ -5,7 +7,7 @@
     <img alt="oMLX" src="docs/images/icon-rounded-light.svg" width="140">
   </picture>
 </p>
-<p> This branch of oMLX has one purpose: allow download and running of Baidu's Ernie 5.5. flash LLM. It has only been tested with the Baidu distro on a Mac M5 Ultra, 256 gig.</p>
+
 
 <h1 align="center">oMLX</h1>
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
