@@ -12,10 +12,7 @@ release. The work is described for the maintainer in
 [jundot/omlx discussion 5656](https://github.com/jundot/omlx/discussions/5656).
 Everything from the oMLX logo down is the upstream README, unchanged.
 
-> [!IMPORTANT]
-> The code is not on `main`. Use the branch
-> [`ernie55-preview/9-single-repo`](https://github.com/arfung/omlx/tree/ernie55-preview/9-single-repo).
-> It is oMLX 0.8.4 plus the ERNIE work, and it needs no other repository.
+`main` is oMLX 0.8.4 plus the ERNIE work. It needs no other repository.
 
 ## The model
 
@@ -93,7 +90,6 @@ Requires Apple Silicon, macOS 15 or later and Python 3.11 to 3.13.
 ```bash
 git clone https://github.com/arfung/omlx.git
 cd omlx
-git checkout ernie55-preview/9-single-repo
 python3 -m venv .venv
 source .venv/bin/activate
 make install
@@ -148,11 +144,14 @@ branches. oMLX is by [jundot](https://github.com/jundot).
 
 ## The other branches
 
-Branches `ernie55-preview/1-base` to `8-decode-pipelining` hold the same work
-in reviewable steps, and need the matching branches of
-[arfung/mlx-vlm](https://github.com/arfung/mlx-vlm). That fork stays up in
-case the mlx-vlm maintainers want the changes there. To run the model, branch
-9 alone is enough.
+To run the model, `main` is all you need. The branches are for review.
+
+- [`ernie55-preview/9-single-repo`](https://github.com/arfung/omlx/tree/ernie55-preview/9-single-repo)
+  is the same code as `main`, as one reviewable commit on top of branch 8.
+- `ernie55-preview/1-base` to `8-decode-pipelining` hold the work in
+  reviewable steps. They need the matching branches of
+  [arfung/mlx-vlm](https://github.com/arfung/mlx-vlm). That fork stays up in
+  case the mlx-vlm maintainers want the changes there.
 
 ---
 
