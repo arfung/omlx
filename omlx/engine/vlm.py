@@ -332,6 +332,11 @@ def _apply_template_thinking_mode(
     _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
     _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
     _apply_inkling2_reasoning_mode(model_type, template_kwargs)
+    if model_type == "ernie5_5_moe":
+        effort = template_kwargs.get("reasoning_effort")
+        if isinstance(effort, str) and effort.lower() in {"none", "off", "no_think"}:
+            template_kwargs.pop("reasoning_effort")
+            template_kwargs["enable_thinking"] = False
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -2021,6 +2026,10 @@ class VLMBatchedEngine(BaseEngine):
                 ),
             ):
                 model_type = _read_config_model_type(self._model_name)
+                if model_type == "ernie5_5_moe":
+                    from ..patches.deepseek_v4 import apply_pooling_cache_support
+
+                    apply_pooling_cache_support()
                 if model_type in {"mimo_v2", "mimo_v2_flash"}:
                     from ..patches.mimo_v2.omnimodal import (
                         has_vision_sidecar,
@@ -2085,7 +2094,12 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type in INKLING2_MODEL_TYPES:
-                    loaded = inkling2_vlm.load(self._model_name)
+                    loaded = inkling2_vlm.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
                     apply_loopcd(loaded[0], self._model_settings)
                     return loaded
                 if model_type == "muse_spark":
@@ -2752,6 +2766,15 @@ class VLMBatchedEngine(BaseEngine):
             )
             if tagged:
                 logger.info("MiniMax A8 prefill on %d modules", tagged)
+        elif a8_on and self.model_type == "ernie5_5_moe":
+            from ..patches.ernie5_5 import a8 as ernie_a8
+
+            tagged = ernie_a8.tag(
+                self._vlm_model,
+                int(getattr(self._model_settings, "a8_prefill_min_tokens", 128)),
+            )
+            if tagged:
+                logger.info("ERNIE A8 prefill on %d expert layers", tagged)
         elif a8_on and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
@@ -2857,6 +2880,8 @@ class VLMBatchedEngine(BaseEngine):
         block_size = None
         if self._model_settings is not None:
             block_size = getattr(self._model_settings, "vlm_mtp_draft_block_size", None)
+        if block_size is None:
+            block_size = getattr(drafter, "default_block_size", None)
         scheduler = None
         if self._engine is not None and hasattr(self._engine, "engine"):
             scheduler = getattr(self._engine.engine, "scheduler", None)
@@ -3002,6 +3027,11 @@ class VLMBatchedEngine(BaseEngine):
         and loads the correct per-model parser.  Falls back to mlx_lm if the
         mlx_vlm.tools.parsers package is not present.
         """
+        if self.model_type == "ernie5_5_moe":
+            from ..adapter.output_parser import install_ernie55_tokenizer_protocol
+
+            if install_ernie55_tokenizer_protocol(tokenizer):
+                return
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
@@ -4111,6 +4141,11 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
+        if model_type == "ernie5_5_moe" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "ERNIE 5.5 Flash is a text-only model.",
+                field="messages",
+            )
         if model_type == "flint" and (num_images or num_audios or num_videos):
             raise InvalidRequestError(
                 "Flint is a text-only model and does not support "
@@ -4236,6 +4271,15 @@ class VLMBatchedEngine(BaseEngine):
         _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
+        if model_type == "ernie5_5_moe" and callable(
+            getattr(template_target, "encode_segments", None)
+        ):
+            # Baidu's renderer distinguishes literal control tokens from
+            # ordinary user text. Keep its token IDs through generation.
+            render_kwargs = {k: v for k, v in template_kwargs.items() if k != "tokenize"}
+            rendered = template_target.render_chat(formatted_messages, **render_kwargs)
+            token_ids = template_target.encode_segments(rendered.segments)
+            return token_ids, None, None, None, 0, []
         if prompt_only:
             prompt = formatted_messages[-1]
         else:
@@ -6147,6 +6191,24 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, _, _, _ = self._extract_request_media(messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
+        if self.model_type == "ernie5_5_moe" and callable(
+            getattr(self._tokenizer, "encode_segments", None)
+        ):
+            if is_partial is None:
+                is_partial = detect_and_strip_partial(text_messages)
+            else:
+                for message in text_messages:
+                    message.pop("partial", None)
+            template_kwargs = {
+                "add_generation_prompt": not is_partial,
+                "continue_final_message": bool(is_partial),
+                "tools": template_tools,
+                "enable_thinking": self._enable_thinking,
+                **(chat_template_kwargs or {}),
+            }
+            _apply_template_thinking_mode(self.model_type, template_kwargs)
+            rendered = self._tokenizer.render_chat(text_messages, **template_kwargs)
+            return rendered.text, self._tokenizer.encode_segments(rendered.segments)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,

@@ -112,6 +112,7 @@ from .speculative.processing_sampler import (
 from .speculative.vlm_mtp import (
     VLMMTPDrafter,
     run_vlm_mtp_decode,
+    shared_block_rounds,
     vlm_mtp_positioned_sampling_available,
 )
 from .utils.fatal import (
@@ -290,6 +291,19 @@ class _VLMMTPDecodeState:
     stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
     finished: bool = False
+
+
+@dataclass
+class _PlainRow:
+    """A request lifted out of the generation batch in the middle of its reply."""
+
+    cache: list[Any]
+    # The tokens ``cache`` holds: the prompt and everything emitted so far.
+    tokens: list[int]
+    # Sampled by the batch's last step; neither emitted nor in the cache yet.
+    pending: int
+    # Tokens the request may still emit after the pending one.
+    max_tokens: int
 
 
 @dataclass
@@ -2589,11 +2603,15 @@ class Scheduler:
         # is exhausted long before any byte limit — the
         # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
         # Periodic materialization collapses the chain; enable it for every
-        # ArraysCache hybrid, not just MiniMax.
+        # ArraysCache hybrid, not just MiniMax. Models with a pooled history
+        # (ERNIE 5.5 Flash) hit the same limit: two batched requests failed
+        # about 11,500 tokens in, one buffer per layer per step.
         model_name_lower = (self.config.model_name or "").lower()
         self._decode_eval_kv_cache_interval: int = (
             256
-            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            if "minimax" in model_name_lower
+            or self._model_has_arrays_cache()
+            or self._detect_pooling_cache()
             else 0
         )
         self._tokens_since_kv_cache_eval: int = 0
@@ -11828,6 +11846,7 @@ class Scheduler:
         sampler: Callable[[Any], Any],
         state_machine: Any,
         logits_processors: list[Any] | None = None,
+        resumed: _PlainRow | None = None,
     ) -> int | None:
         """Bypass BatchGenerator and stand up a vlm_mtp generator instead.
 
@@ -11835,6 +11854,11 @@ class Scheduler:
         and ``return_shared_kv=True`` so the drafter has the targets it
         needs, samples the first bonus token from the resulting logits, and
         returns a synthesized uid that ``step()`` will drive.
+
+        ``resumed`` is a request that leaves the generation batch in the
+        middle of its reply (``_promote_plain_requests``, which has already
+        decided that it should draft): ``last_tokens`` is then the token it
+        sampled last, and its history and token budget come from the row.
 
         Returns ``None`` if the eligibility check fails at the last second
         (drafter missing, language model lacks rollback hook, etc.) so the
@@ -11881,12 +11905,18 @@ class Scheduler:
         # only one vlm_mtp generator can own it at a time. A request that
         # arrives after MTP has started cannot be migrated here; retain the
         # existing safe BatchGenerator fallback for that late-arrival case.
-        if self._vlm_mtp_active:
+        # A block drafter whose target verifies several requests in one
+        # forward keeps that state per request (speculative/block_rows.py).
+        shared_rounds = shared_block_rounds(
+            drafter, self.model, getattr(self, "_vlm_mtp_draft_block_size", None)
+        )
+        drafting_count = len(self._vlm_mtp_active)
+        if drafting_count and shared_rounds is None:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
                 "request(s); falling back to BatchGenerator",
                 request.request_id,
-                len(self._vlm_mtp_active),
+                drafting_count,
             )
             return None
 
@@ -11901,7 +11931,26 @@ class Scheduler:
             getattr(prefill, "request_id", None) != request.request_id
             for prefill in getattr(self, "prefilling", ())
         )
-        if waiting_count or running_count or prefilling_count:
+        if shared_rounds is not None:
+            # A few requests draft together. Peers that already decode
+            # without drafting are joined instead, and so are three or more
+            # that start at once: on ERNIE 5.5 Flash they batch as fast
+            # without drafting. A request that arrives while others draft
+            # joins them while there is room, since they cannot move.
+            if running_count > drafting_count:
+                contended = True
+            elif drafting_count:
+                contended = drafting_count >= shared_rounds.max_requests
+            else:
+                contended = (
+                    waiting_count + prefilling_count >= shared_rounds.start_together
+                )
+        else:
+            contended = bool(waiting_count or running_count or prefilling_count)
+        if resumed is not None:
+            # Already running, and counted among the running requests above.
+            contended = shared_rounds is None or not shared_rounds.has_room()
+        if contended:
             logger.info(
                 "vlm_mtp routing skipped for %s: scheduler contention "
                 "(running=%d waiting=%d prefilling=%d); falling back to "
@@ -11954,16 +12003,34 @@ class Scheduler:
             )
             return None
 
+        # What the cache holds once ``last_tokens`` are in it, and how many
+        # tokens may follow.
+        if resumed is None:
+            history = list(request.prompt_token_ids or [])
+            max_tokens = request.sampling_params.max_tokens
+        else:
+            history = list(resumed.tokens) + [int(resumed.pending)]
+            max_tokens = resumed.max_tokens
+
         mtp_sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
         proc_sampler: MTPProcessingSampler | None = None
         if mtp_processors:
             proc_sampler = MTPProcessingSampler(
                 mtp_sampler,
                 mtp_processors,
-                request.prompt_token_ids or [],
+                history,
             )
             mtp_sampler = proc_sampler
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
+        # A block drafter reads chosen decoder-layer outputs of every committed
+        # position; an MTP head reads the final hidden state of the last one.
+        block_drafter = getattr(drafter, "draft_kind", None) == "dflash"
+        if block_drafter:
+            forward_kwargs = {
+                "capture_layer_ids": list(drafter.model.config.target_layer_ids)
+            }
+        else:
+            forward_kwargs = {"return_hidden": True, "return_shared_kv": True}
         try:
             with mx.stream(self._stream):
                 set_batch_rope = getattr(target_model, "set_batch_rope_deltas", None)
@@ -11972,8 +12039,7 @@ class Scheduler:
                 out = target_model(
                     last_arr,
                     cache=prefilled_cache,
-                    return_hidden=True,
-                    return_shared_kv=True,
+                    **forward_kwargs,
                 )
                 mx.eval([c.state for c in prefilled_cache])
         except Exception as e:
@@ -12004,14 +12070,18 @@ class Scheduler:
         if proc_sampler is not None:
             proc_sampler.note_first_bonus(int(first_bonus_arr.item()))
 
-        if isinstance(hidden_raw, list):
-            hidden = hidden_raw[-1]
+        if block_drafter:
+            # Every position of this forward seeds the drafter's context.
+            hidden = mx.concatenate(list(hidden_raw), axis=-1)
         else:
-            hidden = hidden_raw
-        # Slice to last position so the drafter sees a [B, 1, H] tensor
-        # regardless of how many tokens this forward processed.
-        if hidden.shape[1] > 1:
-            hidden = hidden[:, -1:, :]
+            if isinstance(hidden_raw, list):
+                hidden = hidden_raw[-1]
+            else:
+                hidden = hidden_raw
+            # Slice to last position so the drafter sees a [B, 1, H] tensor
+            # regardless of how many tokens this forward processed.
+            if hidden.shape[1] > 1:
+                hidden = hidden[:, -1:, :]
 
         # Combine base stop tokens (EOS, Harmony, generation_config) with
         # request-specific stop_token_ids — same shape as _build_state_machine.
@@ -12034,11 +12104,15 @@ class Scheduler:
                     else {}
                 ),
                 first_bonus=int(first_bonus_arr.item()),
-                max_tokens=request.sampling_params.max_tokens,
+                max_tokens=max_tokens,
                 sampler=mtp_sampler,
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
+                greedy=not float(
+                    getattr(request.sampling_params, "temperature", 0.0) or 0.0
+                ),
+                history=history if block_drafter else None,
             )
         except Exception as e:
             logger.warning(
@@ -12060,17 +12134,168 @@ class Scheduler:
             prompt_cache=prefilled_cache,
             sampler=mtp_sampler,
             state_machine=state_machine,
-            max_tokens=request.sampling_params.max_tokens,
+            max_tokens=max_tokens,
             stop_token_ids=set(eos_ids),
         )
         request.prompt_cache = None
         logger.info(
-            "vlm_mtp decode started: request=%s uid=%d block_size=%s",
+            "vlm_mtp decode started: request=%s uid=%d block_size=%s%s",
             request.request_id,
             uid,
             self._vlm_mtp_draft_block_size,
+            (
+                ""
+                if resumed is None
+                else f" (moved from plain decoding, {max_tokens} tokens left)"
+            ),
         )
         return uid
+
+    # A request moved to the drafter needs this much of its budget left.
+    _PROMOTE_MIN_TOKENS = 16
+
+    def _plain_rows_to_promote(self) -> list[tuple[Request, int]]:
+        """Requests decoding without drafting that should now start to draft.
+
+        Requests that overlap at their start batch without drafting, which is
+        the faster way to decode several. Once enough of them have finished,
+        the ones left would decode faster drafting, alone or together. They
+        move when the requests still running are few enough to be admitted to
+        the drafter had they just arrived: at most ``start_together`` when
+        none drafts yet, or while the drafting ones have room. All of them
+        move or none does, because one request left batching beside the
+        drafter's rounds slows both.
+        """
+        drafter = self._vlm_mtp_drafter
+        if drafter is None or self.batch_generator is None:
+            return []
+        drafting = len(self._vlm_mtp_active)
+        if len(self.running) <= drafting or self.waiting or self.prefilling:
+            return []
+        plain = [
+            (request, uid)
+            for request_id, request in self.running.items()
+            if (uid := self.request_id_to_uid.get(request_id, -1)) >= 0
+        ]
+        if not plain or any(
+            getattr(request, "_draft_promotion_declined", False) for request, _ in plain
+        ):
+            return []
+        shared_rounds = shared_block_rounds(
+            drafter, self.model, getattr(self, "_vlm_mtp_draft_block_size", None)
+        )
+        if shared_rounds is None:
+            return []
+        limit = shared_rounds.max_requests if drafting else shared_rounds.start_together
+        if drafting + len(plain) > limit:
+            return []
+        lm = getattr(self.model, "_language_model", None)
+        if lm is None or not hasattr(lm, "rollback_speculative_cache"):
+            return []
+
+        for request, uid in plain:
+            params = request.sampling_params
+            row = self._memory_requeue_row(uid)
+            if row is None or request.request_id in self._pending_abort_ids:
+                # Still entering the batch, or about to leave it.
+                return []
+            generation, index = row
+            generation._omlx_realign_rows()
+            processors = [
+                proc
+                for proc in generation.logits_processors[index] or ()
+                if not getattr(proc, "_omlx_suppress_processor", False)
+            ]
+            if (
+                params.logprobs
+                or getattr(request, "specprefill_indices", None) is not None
+                or not all(supports_vlm_mtp_processing(proc) for proc in processors)
+                or (
+                    processors and not vlm_mtp_positioned_sampling_available(self.model)
+                )
+            ):
+                # Nothing about this changes while the request runs.
+                request._draft_promotion_declined = True
+                return []
+            left = generation.max_tokens[index] - generation._num_tokens[index] - 1
+            pending = generation._next_tokens
+            if pending is None or left < self._PROMOTE_MIN_TOKENS:
+                return []
+            eos_ids = set(params.stop_token_ids or ())
+            if not getattr(params, "ignore_eos", False):
+                eos_ids |= self._get_stop_tokens()
+            if int(pending[index].item()) in eos_ids:
+                # The batch ends this request on its next step.
+                return []
+        return plain
+
+    def _promote_plain_requests(self) -> list[_VLMMTPResponse]:
+        """Move requests out of the generation batch and into the drafter.
+
+        Each one takes its cache and the token it sampled last out of the
+        batch. That token is emitted here, and the forward that feeds it to
+        the cache is the one that seeds the drafter, so the move costs no
+        decode step. Returns the responses for the tokens emitted.
+        """
+        responses: list[_VLMMTPResponse] = []
+        plain = self._plain_rows_to_promote()
+        if not plain:
+            return responses
+        # The batch's last step is still in flight; see _do_abort_request.
+        _safe_sync_stream(self._stream)
+        for request, uid in plain:
+            request_id = request.request_id
+            generation, index = self._memory_requeue_row(uid)
+            sampler = generation.samplers[index] or generation.fallback_sampler
+            processors = list(generation.logits_processors[index] or ())
+            stop_sequences = generation.stop_sequences[index]
+            emitted = generation._num_tokens[index]
+            left = generation.max_tokens[index] - emitted - 1
+            with mx.stream(self._stream):
+                pending = int(generation._next_tokens[index].item())
+                cache, tokens = self.batch_generator.remove(
+                    [uid], return_prompt_caches=True
+                )[uid]
+            row = _PlainRow(
+                cache=cache, tokens=list(tokens), pending=pending, max_tokens=left
+            )
+            new_uid = self._route_to_vlm_mtp(
+                request,
+                cache,
+                [pending],
+                sampler,
+                stop_sequences,
+                logits_processors=processors,
+                resumed=row,
+            )
+            if new_uid is None:
+                # The row has left the batch and its cache may hold the
+                # pending token by now, so it cannot go back.
+                logger.error(
+                    "Request %s could not start drafting after %d tokens of "
+                    "plain decoding; failing it",
+                    request_id,
+                    emitted,
+                )
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=0,
+                        finish_reason="error",
+                        error="could not move the request to the drafter",
+                    )
+                )
+                continue
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
+            _unregister_uid_row(self.model, uid)
+            del self.uid_to_request_id[uid]
+            self.request_id_to_uid[request_id] = new_uid
+            self.uid_to_request_id[new_uid] = request_id
+            request.batch_uid = new_uid
+            _mark_text_positions(self.model, request, new_uid)
+            responses.append(_VLMMTPResponse(uid=new_uid, token=pending))
+        return responses
 
     def _log_moe_offload_stats(self, request: Request) -> None:
         """Log the expert cache counters accrued while ``request`` ran.
@@ -12109,7 +12334,14 @@ class Scheduler:
         drafter = self._vlm_mtp_drafter
         if drafter is None:
             return
-        accept_lens = getattr(drafter.model, "accept_lens", None)
+        # Shared block rounds keep each request's counts with the request.
+        stats = drafter.model
+        shared_rounds = getattr(drafter, "shared_rounds", None)
+        if shared_rounds is not None:
+            row = shared_rounds.row_for(state.prompt_cache)
+            if row is not None:
+                stats = row
+        accept_lens = getattr(stats, "accept_lens", None)
         if not accept_lens:
             return
         try:
@@ -12124,7 +12356,12 @@ class Scheduler:
             getattr(drafter.model.config, "block_size", 4)
         )
         max_per_round = max(1, block_size - 1)
-        acceptance_rate = total_accepted / (rounds * max_per_round)
+        total_drafted = rounds * max_per_round
+        # A drafter that varies its depth per round reports what it drafted.
+        draft_lens = getattr(stats, "draft_lens", None)
+        if isinstance(draft_lens, list) and len(draft_lens) == rounds:
+            total_drafted = max(1, sum(int(x) for x in draft_lens))
+        acceptance_rate = total_accepted / total_drafted
         avg_tokens_per_round = (total_accepted + rounds) / rounds
         logger.info(
             "vlm_mtp stats: request=%s finish=%s rounds=%d "
@@ -12134,7 +12371,7 @@ class Scheduler:
             finish_reason,
             rounds,
             total_accepted,
-            rounds * max_per_round,
+            total_drafted,
             acceptance_rate * 100,
             avg_tokens_per_round,
             state.emitted,
@@ -12180,13 +12417,11 @@ class Scheduler:
                 state.finished = True
                 continue
 
-            # Single-request mode yields ints; batch mode (not yet routed
-            # by omlx) would yield a list. Guard so the path stays robust
-            # if we widen routing later.
+            # One token per step from mlx-vlm's own loops. Shared block
+            # rounds yield a list: this request's tokens of one round.
             if isinstance(token_val, list):
-                # Take the first row (we only route singles for now).
-                tok = next((t for t in token_val if t is not None), None)
-                if tok is None:
+                tokens = [int(t) for t in token_val if t is not None]
+                if not tokens:
                     responses.append(
                         _VLMMTPResponse(
                             uid=uid,
@@ -12197,35 +12432,40 @@ class Scheduler:
                     )
                     state.finished = True
                     continue
-                token = int(tok)
             else:
-                token = int(token_val)
+                tokens = [int(token_val)]
 
-            state.emitted += 1
-            finish_reason: str | None = None
-            if state.stop_token_ids and token in state.stop_token_ids:
-                finish_reason = "stop"
-            elif state.emitted >= state.max_tokens:
-                finish_reason = "length"
+            for token in tokens:
+                state.emitted += 1
+                finish_reason: str | None = None
+                if state.stop_token_ids and token in state.stop_token_ids:
+                    finish_reason = "stop"
+                elif state.emitted >= state.max_tokens:
+                    finish_reason = "length"
 
-            if finish_reason is not None:
-                self._log_vlm_mtp_stats(state, finish_reason)
+                if finish_reason is not None:
+                    self._log_vlm_mtp_stats(state, finish_reason)
 
-            responses.append(
-                _VLMMTPResponse(
-                    uid=uid,
-                    token=token,
-                    finish_reason=finish_reason,
-                    prompt_cache=(
-                        state.prompt_cache if finish_reason is not None else None
-                    ),
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=token,
+                        finish_reason=finish_reason,
+                        prompt_cache=(
+                            state.prompt_cache if finish_reason is not None else None
+                        ),
+                    )
                 )
-            )
-            if finish_reason is not None:
-                state.finished = True
+                if finish_reason is not None:
+                    state.finished = True
+                    break
 
-        # Drop finished entries.
+        # Drop finished entries. Closing the generator takes the request out
+        # of shared block rounds at once, not when it is collected.
         for uid in [u for u, s in self._vlm_mtp_active.items() if s.finished]:
+            close = getattr(self._vlm_mtp_active[uid].generator, "close", None)
+            if callable(close):
+                close()
             del self._vlm_mtp_active[uid]
 
         return responses
@@ -16195,10 +16435,11 @@ class Scheduler:
                     self._moe_offload_slots_released = False
                     self.moe_offload_restore(lambda: Scheduler._clear_cache(self))
                 _t_decode_start = time.perf_counter()
+                # Requests left decoding without drafting once their peers
+                # have finished move to the drafter before this step.
+                responses = self._promote_plain_requests()
                 if self.batch_generator is not None:
-                    responses = list(self.batch_generator.next_generated())
-                else:
-                    responses = []
+                    responses.extend(self.batch_generator.next_generated())
                 # Drive vlm_mtp generators alongside BatchGenerator. Order
                 # matters only for log determinism; _process_batch_responses
                 # is per-uid.

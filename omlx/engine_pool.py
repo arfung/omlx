@@ -2299,7 +2299,11 @@ class EnginePool:
 
         def estimate(context: int | None) -> int:
             return splash_memory_estimate(
-                entry.model_path, target.draft_path, context, settings.splash_kv_format
+                entry.model_path,
+                target.draft_path,
+                context,
+                settings.splash_kv_format,
+                target.binary.version,
             )
 
         context = self._splash_sizing_context(entry, model_settings, target)
@@ -2453,6 +2457,7 @@ class EnginePool:
             target.draft_path,
             requested_context,
             integrations.splash_kv_format,
+            target.binary.version,
         ):
             # The budget cannot hold the explicit limit (the room under the
             # memory limit shrank, or splash_max_memory_gb is small), and
@@ -4695,13 +4700,25 @@ class EnginePool:
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
+            # A checkpoint that bundles its block drafter (ERNIE 5.5 Flash
+            # Preview's DSpark head) is its own draft model.
+            bundled_draft = None
+            if model_settings is not None and getattr(
+                model_settings, "vlm_mtp_enabled", False
+            ):
+                from .speculative.vlm_mtp import bundled_block_drafter_path
+
+                bundled_draft = bundled_block_drafter_path(entry.model_path)
             if (
                 model_settings is not None
                 and getattr(model_settings, "vlm_mtp_enabled", False)
-                and getattr(model_settings, "vlm_mtp_draft_model", None)
+                and (
+                    getattr(model_settings, "vlm_mtp_draft_model", None)
+                    or bundled_draft
+                )
                 and hasattr(engine, "set_vlm_mtp_drafter")
             ):
-                drafter_id = model_settings.vlm_mtp_draft_model
+                drafter_id = model_settings.vlm_mtp_draft_model or bundled_draft
                 drafter_entry = self._entries.get(drafter_id)
                 drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
 

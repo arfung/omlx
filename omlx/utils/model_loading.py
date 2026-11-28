@@ -932,6 +932,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "ernie5_5_moe":
+        from ..patches.mlx_vlm_ernie5_5_compat import (
+            apply_mlx_vlm_ernie5_5_compat_patch,
+        )
+
+        if apply_mlx_vlm_ernie5_5_compat_patch():
+            logger.info(
+                "ERNIE 5.5 mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type == "unlimited-ocr":
         from ..patches.mlx_vlm_unlimited_ocr_compat import (
             apply_mlx_vlm_unlimited_ocr_compat_patch,

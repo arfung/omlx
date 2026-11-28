@@ -7,15 +7,27 @@ import json
 
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 try:
     import mlx.core as mx
+    import mlx.nn as nn
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
-from omlx.patches.inkling2 import loopcd
+from omlx.patches.inkling2 import fused, kernels, loopcd
+from omlx.patches.inkling2 import model as inkling2_model
+from omlx.patches.moe_expert_offload import (
+    apply_moe_expert_offload,
+    materialize_offload_state,
+    moe_offload_stats,
+)
+from omlx.patches.qwen35_verify_qmm import (
+    apply_verify_qmm_patch,
+    set_verify_qmm_armed,
+)
 
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
@@ -902,6 +914,43 @@ def test_inkling2_rows_with_different_windows_decode_together():
     assert diff[..., :300].max().item() < 1e-3
 
 
+def test_inkling2_batch_verify_rolls_each_row_back_to_its_own_count():
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_LOOPCD)
+    ids = mx.random.randint(0, 300, (2, 70))
+    lengths, rounds, block = (41, 9), ([1, 5], [6, 0]), 7
+    ends = list(lengths)
+    for accepted in rounds:
+        ends = [end + a + 1 for end, a in zip(ends, accepted)]
+    alone, expected = [], []
+    for row, (n, end) in enumerate(zip(lengths, ends)):
+        cache = model.make_cache()
+        model(ids[row : row + 1, :n], cache=cache)
+        alone.append(cache)
+        reference = model.make_cache()
+        model(ids[row : row + 1, :end], cache=reference)
+        expected.append(model(ids[row : row + 1, end : end + 1], cache=reference))
+    joined = []
+    for a, b in zip(*alone):
+        if hasattr(a, "offset"):
+            joined.append(type(a).merge([a, b]))
+        else:
+            a.extend(b)
+            joined.append(a)
+    starts = list(lengths)
+    for accepted in rounds:
+        tokens = mx.stack([ids[row, s : s + block] for row, s in enumerate(starts)])
+        out = model(tokens, cache=joined, return_hidden=True, capture_layer_ids=[5])
+        assert out.gdn_states == []
+        model.rollback_speculative_cache(joined, out.gdn_states, accepted, block)
+        starts = [s + a + 1 for s, a in zip(starts, accepted)]
+    nxt = mx.stack([ids[row, end : end + 1] for row, end in enumerate(ends)])
+    short = [c.extract(1) for c in joined]
+    got = mx.concatenate([model(nxt, cache=joined), model(nxt[1:], cache=short)])
+    for row, want in enumerate([*expected, expected[1]]):
+        diff = mx.abs(got[row, :, :300] - want[0, :, :300]).max().item()
+        assert diff < 1e-3
+
+
 def test_inkling2_restored_state_decodes_and_joins_like_the_live_one():
     # The prefix cache rebuilds a sliding state as a plain ArraysCache inside
     # oMLX's size wrapper, without the growth buffers.
@@ -1312,6 +1361,73 @@ def test_inkling2_nvfp4_experts_stay_finite_in_float16():
     assert rel.item() < 1e-2
 
 
+_OFFLOAD_DIMS = dict(n_routed_experts=32, num_experts_per_tok=8)
+
+
+def _inkling2_offloaded(tmp_path, dims):
+    reference, model = (_inkling2_tiny(**dims, **_OFFLOAD_DIMS) for _ in range(2))
+    for m in (reference, model):
+        for layer in m.model.layers:
+            for proj in (layer.mlp.experts.w13, layer.mlp.experts.w2):
+                if "global_scale" in proj:
+                    proj.global_scale = proj.global_scale * mx.linspace(0.5, 2, 32)
+    mx.eval(model.parameters())
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(reference.parameters()))
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "inkling2_loop", "text_config": _OFFLOAD_DIMS})
+    )
+    assert apply_moe_expert_offload(model, tmp_path, 0.25) == len(model.model.layers)
+    materialize_offload_state(model)
+    return reference, model
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["mxfp8+nvfp4", "looped"])
+def test_inkling2_offloaded_logits_match_resident(tmp_path, dims):
+    reference, model = _inkling2_offloaded(tmp_path, dims)
+    ids = mx.random.randint(0, 300, (1, 24))
+    outs = []
+    for m in (reference, model):
+        cache = m.make_cache()
+        logits = [m(ids[:, t : t + 1], cache=cache) for t in range(24)]
+        outs.append(mx.concatenate(logits, axis=1))
+    mx.eval(outs)
+    assert mx.array_equal(outs[0][..., :300], outs[1][..., :300]).item()
+    assert moe_offload_stats(model)["misses"] > 8 * len(model.model.layers)
+
+
+def test_inkling2_offload_over_capacity_reads_only_missing_experts(tmp_path):
+    reference, model = _inkling2_offloaded(tmp_path, {})
+    experts = model.model.layers[-1].mlp.experts
+    x = mx.random.normal((64, 128)).astype(mx.bfloat16)
+    inds = mx.arange(64 * 8).reshape(64, 8) % 32
+    w = mx.ones((64, 8))
+    expected = reference.model.layers[-1].mlp.experts(x, inds, w)
+    got = inkling2_model.moe_sum(*experts.unreduced(x, inds, w))
+    assert (mx.abs(got - expected).max() / mx.abs(expected).max()).item() < 1e-2
+    before = experts.cache.misses
+    mx.eval(experts.unreduced(x, inds, w))
+    assert experts.cache.misses - before == 32 - experts.cache.capacity
+
+
+def test_inkling2_offloaded_row_exact_verify_matches_resident(tmp_path):
+    reference, model = _inkling2_offloaded(tmp_path, {})
+    ids = mx.random.randint(0, 300, (1, 19))
+    blocks = []
+    for m in (reference, model):
+        cache = m.make_cache()
+        for t in range(16):
+            m(ids[:, t : t + 1], cache=cache)
+        set_verify_qmm_armed(True, row_exact=True)
+        try:
+            blocks.append(m(ids[:, 16:], cache=cache))
+        finally:
+            set_verify_qmm_armed(False)
+    mx.eval(blocks)
+    assert mx.array_equal(blocks[0][..., :300], blocks[1][..., :300]).item()
+
+
 @pytest.mark.parametrize(
     "batch, heads, kv_heads, length, keys, window, extent, left_padding, dtype",
     [
@@ -1427,8 +1543,6 @@ def test_nax_banded_attention_rows_do_not_depend_on_the_block():
 
 
 def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
-    """Full-attention blocks of more than 8 queries, lone or left-padded,
-    build no mask on NAX hosts; shorter blocks and sliding layers keep SDPA."""
     from omlx.patches.inkling2 import kernels
 
     nax_attention = _nax_banded_or_skip()
@@ -1448,7 +1562,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         (2, 70, lp, 0, True),
         (1, 9, None, 0, True),
         (1, 8, None, 0, False),
-        (1, 70, None, 32, False),
+        (1, 70, None, 32, True),
     ):
         args = _decode_attention_case(batch, 6, 2, length, 300, 32, mx.bfloat16, 128)
         calls.clear()
@@ -1457,7 +1571,7 @@ def test_inkling2_full_attention_prefill_takes_nax_banded(monkeypatch):
         )
         assert any(calls) == taken
         if taken:
-            ref = kernels._masked_attention(*args, scale, 0, padding)
+            ref = kernels._masked_attention(*args, scale, window, padding)
             diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()
             assert diff.item() < 1e-2
 
@@ -1982,3 +2096,86 @@ def test_inkling2_dspark_fold_dequantizes_the_head_in_chunks():
         assert mx.array_equal(head._fold_weight[start:end], expected)
         expected = (rows @ bias).astype(mx.bfloat16)
         assert mx.array_equal(head._fold_bias[start:end], expected)
+
+
+def _attention_inputs(length, keys, hq=8, hkv=2, d=128, r=16):
+    mx.random.seed(length)
+    q = (mx.random.normal((1, hq, length, d)) * 3).astype(mx.bfloat16)
+    k = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    v = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    rel = (mx.random.normal((1, length, hq, r)) * 4).astype(mx.bfloat16)
+    sink = (mx.random.normal((1, length, hq)) * 4 + 6).astype(mx.bfloat16)
+    return q, k, v, rel, sink, d**-0.5
+
+
+@pytest.mark.parametrize("hq", [8, 12])
+@pytest.mark.parametrize("padding", [0, 700])
+@pytest.mark.parametrize("length", [1, 5, 16])
+def test_inkling2_long_attention_matches_reference(length, padding, hq):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("the long-context attention kernel runs on the GPU")
+    q, k, v, rel, sink, scale = _attention_inputs(length, 2600, hq=hq)
+    lp = mx.array([padding]) if padding else None
+    got = fused.long_decode_attention(q, k, v, rel, sink, scale=scale, left_padding=lp)
+    expected = kernels._masked_attention(q, k, v, rel, sink, scale, 0, lp)
+    diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+    assert diff.max().item() < 2e-2
+    s = k.shape[2]
+    for t in range(length):
+        end = s - length + t + 1
+        alone = fused.long_decode_attention(
+            q[:, :, t : t + 1],
+            k[:, :, :end],
+            v[:, :, :end],
+            rel[:, t : t + 1],
+            sink[:, t : t + 1],
+            scale=scale,
+            left_padding=lp,
+        )
+        assert mx.array_equal(got[:, :, t : t + 1], alone)
+
+
+def test_inkling2_long_context_verify_rows_match_serial_decode(monkeypatch):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("row-exact projections run on the GPU")
+    monkeypatch.setattr(inkling2_model, "_LONG_ATTENTION_MIN_KEYS", 4096)
+    calls = []
+    kernel = fused.long_decode_attention
+    monkeypatch.setattr(
+        fused,
+        "long_decode_attention",
+        lambda *a, **kw: calls.append(a[0].shape[2]) or kernel(*a, **kw),
+    )
+    apply_verify_qmm_patch()
+    model = _bf16(_inkling2_tiny(head_dim=128, swa_head_dim=128, **_TINY_LOOP))
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    prefix, width = 4092, 16
+    ids = mx.random.randint(0, 300, (1, prefix + width))
+
+    def prefilled():
+        cache = model.make_cache()
+        for s in range(0, prefix, 2048):
+            model(ids[:, s : min(prefix, s + 2048)], cache=cache)
+            mx.eval([c.state for c in cache])
+        return cache
+
+    cache = prefilled()
+    serial = [
+        model(ids[:, t : t + 1], cache=cache)[0, -1]
+        for t in range(prefix, prefix + width)
+    ]
+    cache = prefilled()
+    calls.clear()
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        block = model(ids[:, prefix : prefix + width], cache=cache)[0]
+    finally:
+        set_verify_qmm_armed(False)
+    assert calls
+    for row, expected in enumerate(serial):
+        assert mx.array_equal(block[row], expected)

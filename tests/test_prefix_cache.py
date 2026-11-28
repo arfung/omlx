@@ -2956,6 +2956,30 @@ class TestPrefixCacheCacheList:
         seq_len = prefix_cache._get_cache_seq_len(cache_data)
         assert seq_len == 128
 
+    def test_get_cache_seq_len_window_layers_before_sequence_layers(
+        self, prefix_cache, mx
+    ):
+        """ERNIE 5.5 layout: window + pooled layers come before full-length ones."""
+        window = (mx.zeros((1, 1, 128, 64)), mx.zeros((1, 1, 128, 0)))
+        pooled = (mx.zeros((1, 69, 64)), mx.zeros((1, 69, 64)), mx.zeros((1, 141, 64)))
+        latent = (mx.zeros((1, 1, 18117, 64)), mx.zeros((1, 1, 18117, 16)))
+        index = (mx.zeros((1, 1, 18117, 32)), mx.zeros((1, 1, 18117, 0)))
+        windowed = {
+            "state": [window, pooled],
+            "cache_type": "CacheList",
+            "class_name": "CacheList",
+        }
+        long_range = {
+            "state": [latent, index],
+            "cache_type": "CacheList",
+            "class_name": "CacheList",
+        }
+
+        cache_data = [windowed, windowed, long_range, windowed]
+
+        # The window is 128 tokens; the cache holds 18117.
+        assert prefix_cache._get_cache_seq_len(cache_data) == 18117
+
     def test_get_cache_seq_len_mixed_kvcache_and_cache_list(self, prefix_cache, mx):
         """Test _get_cache_seq_len with mixed KVCache + CacheList model."""
         kv_keys = mx.zeros((1, 8, 256, 64))

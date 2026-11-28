@@ -9150,6 +9150,18 @@ class TestHybridDecodeKvEvalDefault:
         )
         assert scheduler._decode_eval_kv_cache_interval == 256
 
+    def test_pooling_cache_model_defaults_to_256(self, mock_tokenizer):
+        # ERNIE 5.5 Flash: window layers hold CacheList(RotatingKVCache,
+        # PoolingCache); batched decode ran out of Metal buffers without it.
+        window = type("RotatingKVCache", (), {})()
+        pooled = type("PoolingCache", (), {})()
+        layer = type("CacheList", (), {"caches": (window, pooled)})()
+        model = self._model_with_cache([layer])
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 256
+
     def test_plain_kv_model_defaults_to_0(self, mock_tokenizer):
         stub = type("KVCache", (), {})()
         model = self._model_with_cache([stub])
